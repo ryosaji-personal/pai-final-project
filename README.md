@@ -4,7 +4,7 @@ ROS 2 HumbleとGazebo Fortressを使用し、前方カメラ画像からCNNで�
 
 ## デモ動画
 
-[YouTubeでデモを見る](https://youtu.be/uOre37AHCuc)
+[YouTubeでデモを見る](https://youtu.be/N8OKFfYinjE)
 
 ## 実装内容
 
