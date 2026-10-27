@@ -1,0 +1,503 @@
+import math
+import time
+
+import cv2
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+
+from autonomous_avoidance_v1 import (
+    AutonomousAvoidance,
+    DEVICE,
+)
+
+# ==========================================
+# 制御パラメータ
+# ==========================================
+
+ENABLE_GUI = False
+
+FORWARD_SPEED = 0.05
+TURN_SPEED = 0.25
+
+AVOID_DISTANCE = 0.65
+CONFIDENCE_THRESHOLD = 0.70
+
+# 右旋回45度
+TURN_ANGLE_DEG = 45.0
+
+# 旋回角度の許容誤差
+ANGLE_TOLERANCE_DEG = 1.5
+
+# 実験の時間制限（秒）
+MAX_RUN_SECONDS = 60.0
+
+# 斜め移動の目標距離 [m]
+MOVE_ASIDE_DISTANCE = 0.50
+
+# 斜め移動の速度 [m/s]
+MOVE_ASIDE_SPEED = 0.05
+
+# センサーのタイムアウト
+SENSOR_TIMEOUT = 1.0
+
+WINDOW_NAME = "Autonomous Avoidance V2"
+
+
+# ==========================================
+# 角度計算
+# ==========================================
+
+def normalize_angle(angle):
+    return math.atan2(
+        math.sin(angle),
+        math.cos(angle)
+    )
+
+
+def get_yaw(q):
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    )
+
+
+# ==========================================
+# ROS 2ノード
+# ==========================================
+
+class AutonomousAvoidanceV2(AutonomousAvoidance):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.state = "APPROACH"
+
+        self.odom = None
+        self.last_odom_time = None
+
+        self.turn_start_yaw = None
+        self.target_yaw = None
+
+        # MOVE_ASIDE開始時の位置
+        self.move_start_x = None
+        self.move_start_y = None
+
+        # MOVE_ASIDE開始時の方向
+        self.move_heading = None
+
+        self.run_start_time = None
+
+        self.create_subscription(
+            Odometry,
+            "/model/demoRobot/odometry",
+            self.odom_callback,
+            qos_profile_sensor_data
+        )
+
+        # 親クラスの制御タイマーは実際には使わず、
+        # このクラスの状態遷移制御で動作させる
+        self.timer.cancel()
+
+        self.control_timer = self.create_timer(
+            0.1,
+            self.control_v2
+        )
+
+        self.get_logger().info(
+            "State machine initialized: APPROACH"
+        )
+
+    def odom_callback(self, msg):
+
+        self.odom = msg
+        self.last_odom_time = time.monotonic()
+
+    def current_yaw(self):
+
+        return get_yaw(
+            self.odom.pose.pose.orientation
+        )
+
+    def change_state(self, new_state):
+
+        if self.state == new_state:
+            return
+
+        self.publish_velocity()
+
+        self.get_logger().info(
+            f"STATE: {self.state} -> {new_state}"
+        )
+
+        self.state = new_state
+
+    def control_v2(self):
+
+        if self.finished:
+            return
+
+        now = time.monotonic()
+
+        # センサーの初回受信を待つ
+        if (
+            self.last_image_time is None
+            or self.odom is None
+        ):
+            return
+
+        # センサーの更新が止まった場合
+        if (
+            self.last_odom_time is None
+            or now - self.last_image_time > SENSOR_TIMEOUT
+            or now - self.last_odom_time > SENSOR_TIMEOUT
+        ):
+            self.change_state("STOP")
+            self.get_logger().error(
+                "Sensor timeout: STOP"
+            )
+            self.finished = True
+            return
+
+        if self.run_start_time is None:
+            self.run_start_time = now
+
+        # 実験時間の上限
+        if now - self.run_start_time > MAX_RUN_SECONDS:
+
+            self.change_state("STOP")
+
+            self.get_logger().warning(
+                "Maximum run time reached"
+            )
+
+            self.finished = True
+            return
+
+        image = self.last_image.copy()
+
+        # CNNによる障害物の分類
+        label, confidence = self.predict(image)
+
+        # 距離推定
+        from distance_estimation import (
+            detect_red_box,
+            FX,
+            BOX_WIDTH
+        )
+
+        box, _ = detect_red_box(image)
+
+        distance = None
+        clipped = False
+
+        if box is not None:
+
+            x, y, w, h = box
+
+            clipped = (
+                x <= 1
+                or x + w >= image.shape[1] - 1
+            )
+
+            if not clipped and w > 0:
+                distance = FX * BOX_WIDTH / w
+
+        action = "STOP"
+
+        # ======================================
+        # APPROACH：障害物へ接近
+        # ======================================
+
+        if self.state == "APPROACH":
+
+            if confidence < CONFIDENCE_THRESHOLD:
+
+                self.publish_velocity()
+                action = "WAIT_LOW_CONF"
+
+            elif clipped:
+
+                self.publish_velocity()
+                action = "WAIT_CLIPPED"
+
+            elif box is None and label != "none":
+
+                self.publish_velocity()
+                action = "WAIT_NO_DISTANCE"
+
+            elif box is not None and label == "none":
+
+                self.publish_velocity()
+                action = "WAIT_CONFLICT"
+
+            elif (
+                label == "center"
+                and distance is not None
+                and distance <= AVOID_DISTANCE
+            ):
+
+                self.publish_velocity()
+
+                self.turn_start_yaw = self.current_yaw()
+
+                self.target_yaw = normalize_angle(
+                    self.turn_start_yaw
+                    - math.radians(TURN_ANGLE_DEG)
+                )
+
+                self.change_state("TURN_AWAY")
+
+                action = "START_TURN"
+
+            else:
+
+                self.publish_velocity(
+                    linear=FORWARD_SPEED
+                )
+
+                action = "FORWARD"
+
+        # ======================================
+        # TURN_AWAY：右旋回45度
+        # ======================================
+
+        elif self.state == "TURN_AWAY":
+
+            yaw = self.current_yaw()
+
+            error = normalize_angle(
+                self.target_yaw - yaw
+            )
+
+            tolerance = math.radians(
+                ANGLE_TOLERANCE_DEG
+            )
+
+            if abs(error) <= tolerance:
+
+                # 45°旋回完了時の位置を記録
+                position = self.odom.pose.pose.position
+
+                self.move_start_x = position.x
+                self.move_start_y = position.y
+
+                # 斜め前進する方向を記録
+                self.move_heading = yaw
+
+                # MOVE_ASIDEへ遷移
+                self.change_state("MOVE_ASIDE")
+
+                action = "TURN_COMPLETE"
+
+            else:
+
+                # 目標角度に近づくほど減速する
+                angular = max(
+                    -TURN_SPEED,
+                    min(
+                        TURN_SPEED,
+                        1.5 * error
+                    )
+                )
+
+                self.publish_velocity(
+                    angular=angular
+                )
+
+                action = "TURNING"
+
+        # ======================================
+        # MOVE_ASIDE：右斜め前方へ移動
+        # ======================================
+
+        elif self.state == "MOVE_ASIDE":
+
+            position = self.odom.pose.pose.position
+
+            # 旋回完了位置からの移動量
+            dx = position.x - self.move_start_x
+            dy = position.y - self.move_start_y
+
+            # 移動開始時の進行方向への移動距離
+            traveled = (
+                dx * math.cos(self.move_heading)
+                + dy * math.sin(self.move_heading)
+            )
+
+            remaining = MOVE_ASIDE_DISTANCE - traveled
+
+            if remaining <= 0.01:
+
+                self.change_state("STOP")
+
+                action = "MOVE_COMPLETE"
+
+                self.get_logger().info(
+                    f"MOVE_ASIDE completed: {traveled:.3f} m"
+                )
+
+                self.finished = True
+
+            else:
+
+                # 残り距離に応じて減速
+                linear = min(
+                    MOVE_ASIDE_SPEED,
+                    max(0.01, 0.5 * remaining)
+                )
+
+                # 45°旋回後の方向を維持
+                heading_error = normalize_angle(
+                    self.move_heading - self.current_yaw()
+                )
+
+                angular = max(
+                    -0.15,
+                    min(0.15, 2.0 * heading_error)
+                )
+
+                self.publish_velocity(
+                    linear=linear,
+                    angular=angular
+                )
+
+                action = f"MOVING {traveled:.2f}/{MOVE_ASIDE_DISTANCE:.2f}m"
+
+
+
+        # ======================================
+        # STOP
+        # ======================================
+
+        elif self.state == "STOP":
+
+            self.publish_velocity()
+            action = "STOP"
+            self.finished = True
+
+        # ======================================
+        # 結果表示
+        # ======================================
+
+        display = image.copy()
+
+        if box is not None:
+
+            x, y, w, h = box
+
+            cv2.rectangle(
+                display,
+                (x, y),
+                (x + w, y + h),
+                (0, 255, 0),
+                2
+            )
+
+        distance_text = (
+            f"{distance:.2f} m"
+            if distance is not None
+            else "N/A"
+        )
+
+        yaw_deg = math.degrees(
+            self.current_yaw()
+        )
+
+        lines = [
+            f"State: {self.state}",
+            f"CNN: {label} ({confidence:.1%})",
+            f"Distance: {distance_text}",
+            f"Yaw: {yaw_deg:.1f} deg",
+            f"Action: {action}",
+        ]
+
+        for i, text in enumerate(lines):
+
+            cv2.putText(
+                display,
+                text,
+                (10, 30 + i * 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2
+            )
+
+        if ENABLE_GUI:
+
+            cv2.imshow(
+                WINDOW_NAME,
+                display
+            )
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
+                self.change_state("STOP")
+                self.finished = True
+
+        # ログは1秒ごと
+        if now - self.last_log_time >= 1.0:
+
+            self.get_logger().info(
+                f"state={self.state}, "
+                f"CNN={label}, "
+                f"distance={distance_text}, "
+                f"yaw={yaw_deg:.1f}, "
+                f"action={action}"
+            )
+
+            self.last_log_time = now
+
+
+# ==========================================
+# main
+# ==========================================
+
+def main():
+
+    rclpy.init()
+
+    node = None
+
+    try:
+
+        node = AutonomousAvoidanceV2()
+
+        while rclpy.ok() and not node.finished:
+
+            rclpy.spin_once(
+                node,
+                timeout_sec=0.1
+            )
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        if node is not None:
+
+            # 停止指令を送信
+            for _ in range(5):
+                node.publish_velocity()
+                time.sleep(0.05)
+
+            node.destroy_node()
+
+        cv2.destroyAllWindows()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

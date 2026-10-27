@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# CMake
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Compiled libraries
+*.so
+*.o
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# Local environments
+.venv/
+.env
+.env.*
+!.env.example
+
+# Large datasets and recordings
+*.mp4
+*.webm
+dataset/
+datasets/
+
+# Editor settings
+.vscode/
+.idea/
